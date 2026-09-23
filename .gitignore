@@ -35,6 +35,8 @@ wheels/
 *.db
 *.sqlite
 *.sqlite3
+.venv/
+*.db-journal
 dev.db
 
 # Testing & Coverage
