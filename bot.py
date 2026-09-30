@@ -121,7 +121,23 @@ def create_app(
         DEBUG=app_config.DEBUG,
         TESTING=app_config.TESTING,
         SECRET_KEY=app_config.SECRET_KEY,
+        MAX_CONTENT_LENGTH=1024 * 1024,  # 1MB limit against memory exhaustion attacks
     )
+
+    @app.after_request
+    def set_security_headers(response: Response) -> Response:
+        """Inject defense-in-depth HTTP security headers."""
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+        response.headers["Content-Security-Policy"] = "default-src 'none'"
+        return response
+
+    @app.errorhandler(413)
+    def request_entity_too_large(error):
+        """Reject payloads exceeding 1MB."""
+        logger.warning("Request payload exceeded 1MB limit", extra={"event_type": "security_violation"})
+        return Response("Payload Too Large", status=413, mimetype="text/plain")
 
     # Configure structured logging
     handler = logging.StreamHandler()
