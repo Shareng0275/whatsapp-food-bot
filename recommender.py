@@ -128,6 +128,25 @@ def parse_recommender_query(query: str) -> RecommenderQueryContext:
     raw = query.strip()
     cleaned = raw.lower()
     
+    # Emoji to food taxonomy mapping
+    emoji_map = {
+        "🍕": " pizza ",
+        "🍔": " burger ",
+        "🍟": " fries ",
+        "🍜": " noodles ",
+        "🍲": " soup ",
+        "🍛": " curry ",
+        "🍚": " biryani ",
+        "🥗": " salad ",
+        "🍦": " dessert ",
+        "🍰": " cake ",
+        "🥟": " momos ",
+        "🌯": " rolls ",
+    }
+    for emo, text_rep in emoji_map.items():
+        if emo in cleaned:
+            cleaned = cleaned.replace(emo, text_rep)
+
     # Strip non-alphanumeric except hyphens and spaces
     normalized = re.sub(r"[^a-z0-9\s\-]", " ", cleaned)
     tokens = [w for w in normalized.split() if w]
@@ -135,12 +154,12 @@ def parse_recommender_query(query: str) -> RecommenderQueryContext:
 
     ctx = RecommenderQueryContext(
         raw_query=raw,
-        cleaned_query=cleaned,
+        cleaned_query=cleaned.strip(),
         tokens=tokens,
         semantic_tokens=semantic_tokens
     )
 
-    if not cleaned:
+    if not ctx.cleaned_query or not ctx.tokens:
         return ctx
 
     # 1. Dietary Detection
@@ -538,7 +557,7 @@ def recommend(
     and explainable scoring.
     """
     ctx = parse_recommender_query(query)
-    if not ctx.cleaned_query:
+    if not ctx.cleaned_query or not ctx.tokens:
         return []
 
     # 1. Hard Filtering Stage

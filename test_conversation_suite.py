@@ -280,3 +280,127 @@ class TestConversationRequirements:
         reply = session.handle_message("same")
         assert session.state == State.ADDRESS
         assert "You don't have a saved address." in reply
+
+
+class TestAdvancedDialogueUX:
+    """Tests for conversational UX enhancements: cancel, back, help, status, digressions, clarifications."""
+
+    def test_global_cancel_command(self, repo):
+        session = Session("+919900011122", repo)
+        session.handle_message("Veg Biryani")
+        session.handle_message("1")
+        assert session.state == State.ADDRESS
+        assert session.order.item is not None
+
+        reply = session.handle_message("cancel")
+        assert session.state == State.SEARCHING
+        assert session.order.item is None
+        assert "Order cancelled" in reply
+
+    def test_global_back_navigation(self, repo):
+        session = Session("+919900011122", repo)
+        session.handle_message("Veg Biryani")
+        session.handle_message("1")
+        assert session.state == State.ADDRESS
+
+        # Back from ADDRESS returns to SELECTING
+        reply_back = session.handle_message("back")
+        assert session.state == State.SELECTING
+        assert "Returned to selection" in reply_back
+
+        # Back from SELECTING returns to SEARCHING
+        reply_back_search = session.handle_message("back")
+        assert session.state == State.SEARCHING
+        assert "Returned to search" in reply_back_search
+
+    def test_global_help_command(self, repo):
+        session = Session("+919900011122", repo)
+        reply_help_search = session.handle_message("help")
+        assert session.state == State.SEARCHING
+        assert "Search Help" in reply_help_search
+
+        session.handle_message("Veg Biryani")
+        assert session.state == State.SELECTING
+        reply_help_sel = session.handle_message("help")
+        assert session.state == State.SELECTING
+        assert "Selection Help" in reply_help_sel
+
+    def test_global_status_command(self, repo):
+        session = Session("+919900011122", repo)
+        reply_status_empty = session.handle_message("status")
+        assert "don't have an active in-flight order" in reply_status_empty
+
+        # Complete an order
+        session.handle_message("Veg Biryani")
+        session.handle_message("1")
+        session.handle_message("same")
+        session.handle_message("skip")
+        assert session.state == State.CONFIRMED
+
+        reply_status_active = session.handle_message("status")
+        assert "Order #" in reply_status_active
+        assert "CONFIRMED" in reply_status_active
+
+    def test_mid_flow_intent_digression(self, repo):
+        """User in ADDRESS step changes their mind: 'Actually I want Masala Dosa instead'."""
+        session = Session("+919900011122", repo)
+        session.handle_message("Veg Biryani")
+        session.handle_message("1")
+        assert session.state == State.ADDRESS
+        assert session.order.item.name == "Veg Biryani"
+
+        reply_switch = session.handle_message("Actually I want Masala Dosa instead")
+        assert session.state == State.SELECTING
+        assert "Masala Dosa" in reply_switch
+        assert "Vidyarthi Bhavan" in reply_switch
+
+    def test_clarification_on_mind_change(self, repo):
+        """User says 'I changed my mind' or 'no'."""
+        session = Session("+919900011122", repo)
+        session.handle_message("Veg Biryani")
+        session.handle_message("1")
+        assert session.state == State.ADDRESS
+
+        reply_clarify = session.handle_message("I changed my mind")
+        assert session.state == State.ADDRESS
+        assert "Would you like to pick a different dish" in reply_clarify
+
+    def test_ordinal_selection_with_nlu(self, repo):
+        """User replies with 'the second one' or '2nd'."""
+        session = Session("+919900011122", repo)
+        session.handle_message("Veg Biryani")
+        assert session.state == State.SELECTING
+
+        reply_ord = session.handle_message("the second one")
+        assert session.state == State.ADDRESS
+        assert session.order.item is not None
+
+
+class TestConversationMatrix:
+    """Conversation test matrix covering normal, invalid, unexpected, repeated, and boundary inputs."""
+
+    def test_matrix_repeated_greetings(self, repo):
+        session = Session("+919900011122", repo)
+        for _ in range(5):
+            reply = session.handle_message("hi")
+            assert session.state == State.SEARCHING
+            assert "food ordering assistant" in reply
+
+    def test_matrix_rapid_cancellations(self, repo):
+        session = Session("+919900011122", repo)
+        for _ in range(3):
+            reply = session.handle_message("cancel")
+            assert session.state == State.SEARCHING
+            assert "Order cancelled" in reply
+
+    def test_matrix_malicious_script_injection_input(self, repo):
+        session = Session("+919900011122", repo)
+        reply = session.handle_message("<script>alert(1)</script>")
+        assert session.state == State.SEARCHING
+        # Safe response without crash or execution
+        assert "<script>" not in reply or "couldn't find" in reply
+
+    def test_matrix_unicode_emojis_and_whitespace(self, repo):
+        session = Session("+919900011122", repo)
+        reply = session.handle_message("🍕 🍔 \n\t  ")
+        assert session.state == State.SEARCHING
