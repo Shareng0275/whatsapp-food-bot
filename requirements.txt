@@ -1,4 +1,6 @@
 flask>=3.0.0
 twilio>=9.0.0
 python-dotenv>=1.0.0
+sqlalchemy>=2.0.0
 pytest>=8.0.0
+pytest-cov>=5.0.0

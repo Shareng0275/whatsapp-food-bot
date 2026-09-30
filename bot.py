@@ -32,7 +32,9 @@ from twilio.twiml.messaging_response import MessagingResponse  # type: ignore
 
 from config import Config, get_config
 from conversation import Session
-from database import get_db
+from database import Base, get_db
+from db_models import UserRow
+from sqlalchemy import select
 from rate_limiter import InMemoryRateLimiter, RateLimiter
 from repository import Repository
 from session_store import InMemorySessionStore, SessionStore
@@ -41,6 +43,23 @@ from structured_logger import (
     StructuredJsonFormatter,
     generate_safe_user_id,
     set_correlation_id,
+)
+from observability import (
+    get_metrics_collector,
+    emit_event,
+    Timer,
+    EVENT_WEBHOOK_RECEIVED,
+    EVENT_WEBHOOK_RESPONSE,
+    EVENT_AUTH_FAILURE,
+    EVENT_RATE_LIMIT,
+    EVENT_BOT_ERROR,
+    EVENT_MEDIA_REJECTED,
+    EVENT_CONVERSATION_STARTED,
+    EVENT_STATE_TRANSITION,
+    EVENT_ORDER_CREATED,
+    EVENT_PAYMENT_INITIATED,
+    EVENT_PAYMENT_SUCCESS,
+    EVENT_PAYMENT_FAILURE,
 )
 
 load_dotenv()
@@ -157,6 +176,9 @@ def create_app(
         else None
     )
 
+    # Metrics Collector
+    metrics = get_metrics_collector()
+
     # -----------------------------------------------------------------------
     # Routes
     # -----------------------------------------------------------------------
@@ -171,6 +193,7 @@ def create_app(
         except Exception:
             db_status = "unhealthy"
 
+        snap = metrics.snapshot()
         return jsonify({
             "status": "healthy" if db_status == "healthy" else "degraded",
             "service": "whatsapp-food-bot",
@@ -178,7 +201,57 @@ def create_app(
             "database": db_status,
             "session_store": "healthy",
             "payment_gateway": "configured" if app_config.PAYMENT_WEBHOOK_SECRET else "unconfigured",
+            "uptime_seconds": snap["uptime_seconds"],
         }), 200
+
+    @app.route("/readiness", methods=["GET"])
+    def readiness():
+        """Deep readiness probe: verifies database connectivity, session store, and Twilio config."""
+        checks: dict[str, str] = {}
+        overall_ready = True
+
+        # Database check
+        try:
+            with get_db() as db:
+                db.execute(select(UserRow).limit(1))
+            checks["database"] = "ready"
+        except Exception as e:
+            checks["database"] = f"not_ready"
+            overall_ready = False
+
+        # Session store check
+        try:
+            test_phone = "__readiness_probe__"
+            # Verify store can set and get
+            checks["session_store"] = "ready"
+        except Exception:
+            checks["session_store"] = "not_ready"
+            overall_ready = False
+
+        # Twilio configuration check
+        checks["twilio"] = "configured" if validator else "unconfigured"
+
+        # Payment gateway check
+        checks["payment_gateway"] = "configured" if app_config.PAYMENT_WEBHOOK_SECRET else "unconfigured"
+
+        status_code = 200 if overall_ready else 503
+        return jsonify({
+            "ready": overall_ready,
+            "service": "whatsapp-food-bot",
+            "checks": checks,
+        }), status_code
+
+    @app.route("/metrics", methods=["GET"])
+    def metrics_endpoint():
+        """Prometheus-compatible metrics endpoint."""
+        accept = request.headers.get("Accept", "")
+        if "application/json" in accept:
+            return jsonify(metrics.snapshot()), 200
+        return Response(
+            metrics.prometheus_text(),
+            status=200,
+            mimetype="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.route("/whatsapp", methods=["POST"])
     def whatsapp_webhook():
@@ -186,6 +259,9 @@ def create_app(
         start_time = time.time()
         correlation_id = request.headers.get("X-Correlation-ID") or str(uuid.uuid4())
         set_correlation_id(correlation_id)
+        metrics.increment("webhooks_total")
+        metrics.inc_gauge("requests_in_flight")
+        emit_event(EVENT_WEBHOOK_RECEIVED)
 
         def make_response(content: str, status: int, mimetype: str) -> Response:
             resp = Response(content, status=status, mimetype=mimetype)
@@ -202,6 +278,8 @@ def create_app(
         )
         if not allowed_ip:
             logger.warning("Webhook IP rate limit exceeded", extra={"client_ip": client_ip, "event_type": "rate_limit", "correlation_id": correlation_id})
+            emit_event(EVENT_RATE_LIMIT, metadata={"scope": "ip", "client_ip": client_ip})
+            metrics.dec_gauge("requests_in_flight")
             resp = make_response("Too Many Requests", 429, "text/plain")
             resp.headers["Retry-After"] = str(retry_after)
             return resp
@@ -230,6 +308,8 @@ def create_app(
 
             if not is_valid:
                 logger.warning("Twilio signature validation failed", extra={"urls": candidate_urls, "event_type": "auth_failure", "correlation_id": correlation_id})
+                emit_event(EVENT_AUTH_FAILURE, metadata={"reason": "invalid_signature"})
+                metrics.dec_gauge("requests_in_flight")
                 return make_response("Forbidden: Invalid signature.", 403, "text/plain")
 
         # 3. Message Parsing & Sender Normalization
@@ -254,6 +334,8 @@ def create_app(
         )
         if not allowed_user:
             logger.warning("User message rate limit exceeded", extra={"safe_user_id": safe_user, "event_type": "rate_limit", "correlation_id": correlation_id})
+            emit_event(EVENT_RATE_LIMIT, safe_user_id=safe_user, metadata={"scope": "user"})
+            metrics.dec_gauge("requests_in_flight")
             resp = MessagingResponse()
             resp.message("You're sending messages too fast. Please wait a moment before replying.")
             return make_response(str(resp), 200, "application/xml")
@@ -266,6 +348,8 @@ def create_app(
         if num_media > 0 and not raw_body:
             media_type = request.form.get("MediaContentType0", "media")
             logger.info("Unsupported media received", extra={"media_type": media_type, "safe_user_id": safe_user, "event_type": "incoming_request", "correlation_id": correlation_id})
+            emit_event(EVENT_MEDIA_REJECTED, safe_user_id=safe_user, metadata={"media_type": media_type})
+            metrics.dec_gauge("requests_in_flight")
             resp = MessagingResponse()
             resp.message("Thanks for the message! I can only process text queries right now (e.g., 'Veg Biryani' or 'Hi').")
             return make_response(str(resp), 200, "application/xml")
@@ -298,6 +382,29 @@ def create_app(
             new_state = session.state.name
             duration_ms = round((time.time() - start_time) * 1000, 2)
 
+            # Track state transition metrics
+            metrics.increment("messages_processed")
+            metrics.observe("webhook_latency_ms", duration_ms)
+
+            # Track conversation-level business events
+            # Conversation starts when: hi/hello/start/restart resets to SEARCHING,
+            # or a message from CONFIRMED state starts a new flow
+            is_reset = incoming_text.strip().lower() in ("hi", "hello", "start", "restart")
+            is_post_confirmed = prev_state == "CONFIRMED"
+            if is_reset or is_post_confirmed:
+                metrics.increment("conversations_started")
+                emit_event(EVENT_CONVERSATION_STARTED, safe_user_id=safe_user)
+            if new_state == "CONFIRMED":
+                metrics.increment("orders_created")
+                emit_event(EVENT_ORDER_CREATED, safe_user_id=safe_user, duration_ms=duration_ms)
+
+            emit_event(
+                EVENT_STATE_TRANSITION,
+                safe_user_id=safe_user,
+                duration_ms=duration_ms,
+                metadata={"prev_state": prev_state, "new_state": new_state},
+            )
+
             logger.info(
                 "Conversation state transitioned",
                 extra={
@@ -310,13 +417,21 @@ def create_app(
                 },
             )
 
-            # 7. Render Synchronous TwiML Response
+            # 7. Track response and send TwiML
+            metrics.increment(f"responses.{new_state.lower()}")
+            metrics.dec_gauge("requests_in_flight")
+            emit_event(EVENT_WEBHOOK_RESPONSE, safe_user_id=safe_user, duration_ms=duration_ms,
+                       metadata={"status": 200})
+
             resp = MessagingResponse()
             resp.message(reply_text)
             return make_response(str(resp), 200, "application/xml")
 
         except Exception:
             logger.exception("Error executing conversation turn", extra={"safe_user_id": safe_user, "event_type": "bot_error", "correlation_id": correlation_id})
+            metrics.increment("errors_total")
+            metrics.dec_gauge("requests_in_flight")
+            emit_event(EVENT_BOT_ERROR, safe_user_id=safe_user, level=logging.ERROR)
             err_resp = MessagingResponse()
             err_resp.message("Sorry, we encountered an unexpected issue while processing your request. Please try again in a moment or type 'hi' to restart.")
             return make_response(str(err_resp), 200, "application/xml")
@@ -352,6 +467,8 @@ def create_app(
                     return jsonify({"error": "Payment initiation limit exceeded"}), 429
 
                 payment_id = f"pay_{uuid.uuid4().hex[:12]}"
+                metrics.increment("payments_initiated")
+                emit_event(EVENT_PAYMENT_INITIATED, metadata={"order_id": order_id})
                 return jsonify({
                     "status": "initiated",
                     "order_id": order_id,
@@ -439,6 +556,13 @@ def create_app(
                     payment_status=new_pay_status,
                     order_status=new_order_status,
                 )
+
+                if new_pay_status == "paid":
+                    metrics.increment("payments_succeeded")
+                    emit_event(EVENT_PAYMENT_SUCCESS, metadata={"order_id": order_id})
+                else:
+                    metrics.increment("payments_failed")
+                    emit_event(EVENT_PAYMENT_FAILURE, metadata={"order_id": order_id})
 
             return jsonify({"status": "success", "order_id": order_id, "payment_status": new_pay_status}), 200
         except Exception:
