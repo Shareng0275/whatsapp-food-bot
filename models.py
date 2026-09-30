@@ -14,6 +14,10 @@ class MenuItem:
     price: float            # in rupees
     eta_minutes: int
     tags: list[str] = field(default_factory=list)
+    cuisine: Optional[str] = None
+    votes: int = 50
+    explanation: Optional[str] = None
+    score: Optional[float] = None
 
 
 @dataclass
