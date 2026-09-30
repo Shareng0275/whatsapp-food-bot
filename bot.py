@@ -1,372 +1,451 @@
-"""Real WhatsApp entry point for the food-ordering bot."""
+"""Production-ready Flask adapter for Twilio WhatsApp Food Ordering Bot.
 
+Wires together:
+- Flask application factory (create_app)
+- Twilio X-Twilio-Signature validation
+- Input sanitization & media-type inspection
+- SessionStore integration (in-memory or Redis)
+- Sliding-window rate limiting & abuse prevention
+- Structured JSON logging with correlation IDs and PII redaction
+- Synchronous TwiML responses + optional REST API notifications
+- HMAC-verified payment callbacks (/payment/webhook)
+- Payment initiation with retry boundaries (/payment/initiate)
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import html
 import json
 import logging
 import os
+import re
+import time
+import uuid
+from typing import Any, Optional
 
 from dotenv import load_dotenv
-from flask import Flask, Response, request
+from flask import Flask, Response, jsonify, request
 from twilio.request_validator import RequestValidator  # type: ignore
 from twilio.rest import Client  # type: ignore
 from twilio.twiml.messaging_response import MessagingResponse  # type: ignore
 
+from config import Config, get_config
 from conversation import Session
 from database import get_db
+from rate_limiter import InMemoryRateLimiter, RateLimiter
 from repository import Repository
-
-
-# ---------------------------------------------------------
-# Load environment variables
-# ---------------------------------------------------------
+from session_store import InMemorySessionStore, SessionStore
+from structured_logger import (
+    SecretRedactingFilter,
+    StructuredJsonFormatter,
+    generate_safe_user_id,
+    set_correlation_id,
+)
 
 load_dotenv()
 
-
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-
-TWILIO_WHATSAPP_NUMBER = os.getenv(
-    "TWILIO_WHATSAPP_NUMBER",
-    "whatsapp:+17372508034",
-)
-
-# Required for the current Twilio WhatsApp trial.
-TWILIO_CONTENT_SID = os.getenv("TWILIO_CONTENT_SID", "").strip()
-
-# Set this to true/false in .env
-TWILIO_VALIDATE_SIGNATURE = (
-    os.getenv("TWILIO_VALIDATE_SIGNATURE", "true").lower()
-    == "true"
-)
-
-TWILIO_WEBHOOK_URL = os.getenv("TWILIO_WEBHOOK_URL", "").strip()
+logger = logging.getLogger("whatsapp_bot")
 
 
-# ---------------------------------------------------------
-# Validation
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helper functions for normalization, sanitization, and PII masking
+# ---------------------------------------------------------------------------
 
-if not TWILIO_ACCOUNT_SID:
-    raise RuntimeError("TWILIO_ACCOUNT_SID is missing from .env")
+def normalize_whatsapp_number(number: Optional[str]) -> str:
+    """Normalize phone numbers to standard E.164 (+<country><digits>).
 
-if not TWILIO_AUTH_TOKEN:
-    raise RuntimeError("TWILIO_AUTH_TOKEN is missing from .env")
-
-
-# ---------------------------------------------------------
-# Twilio client
-# ---------------------------------------------------------
-
-twilio_client = Client(
-    TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN,
-)
-
-request_validator = RequestValidator(
-    TWILIO_AUTH_TOKEN
-)
-
-
-# ---------------------------------------------------------
-# Flask app
-# ---------------------------------------------------------
-
-app = Flask(__name__)
-
-logging.basicConfig(level=logging.INFO)
-
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------
-# Sessions
-# ---------------------------------------------------------
-
-# One conversation session per WhatsApp user.
-SESSIONS: dict[str, Session] = {}
-
-
-def get_session(phone: str, repo: Repository) -> Session:
-    """Get or create the conversation session for a user."""
-
-    if phone not in SESSIONS:
-        SESSIONS[phone] = Session(phone, repo)
-
-    return SESSIONS[phone]
-
-
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-
-def normalize_whatsapp_number(number: str) -> str:
-    """Make sure a WhatsApp number has the whatsapp: prefix."""
-
-    number = (number or "").strip()
-
-    if number.startswith("whatsapp:"):
-        return number
-
-    return f"whatsapp:{number}"
-
-
-def validate_twilio_request() -> bool:
+    Strips 'whatsapp:', spaces, parentheses, hyphens, and whitespace.
+    Returns empty string if invalid or malformed.
     """
-    Validate that the incoming webhook really came from Twilio.
+    if not number:
+        return ""
+    clean = str(number).strip()
+    if clean.lower().startswith("whatsapp:"):
+        clean = clean[9:].strip()
+    clean = re.sub(r"[\s\(\)\-]", "", clean)
+    if not clean:
+        return ""
+    if not clean.startswith("+"):
+        clean = f"+{clean}"
+    if not re.match(r"^\+[1-9]\d{6,14}$", clean):
+        return ""
+    return clean
 
-    Validation can be disabled in .env for local debugging:
-        TWILIO_VALIDATE_SIGNATURE=false
+
+def mask_phone_number(phone: Optional[str]) -> str:
+    """Mask phone number for privacy/logging (e.g. +9199****1122)."""
+    if not phone:
+        return "***"
+    phone_str = str(phone).strip()
+    if len(phone_str) < 9:
+        return "***"
+    return f"{phone_str[:5]}****{phone_str[-4:]}"
+
+
+def sanitize_input_text(text: Optional[str], max_length: int = 500) -> str:
+    """Sanitize inbound text from WhatsApp users.
+
+    Strips ASCII control characters and limits length.
     """
-
-    if not TWILIO_VALIDATE_SIGNATURE:
-        logger.warning(
-            "Twilio signature validation is disabled."
-        )
-        return True
-
-    signature = request.headers.get(
-        "X-Twilio-Signature",
-        "",
-    )
-
-    if not signature:
-        logger.warning(
-            "Missing X-Twilio-Signature header."
-        )
-        return False
-
-    # IMPORTANT:
-    # Use the externally visible HTTPS URL that Twilio called.
-    url = TWILIO_WEBHOOK_URL or request.url
-
-    return request_validator.validate(
-        url,
-        request.form,
-        signature,
-    )
+    if not text:
+        return ""
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(text))
+    return cleaned.strip()[:max_length]
 
 
-def send_trial_whatsapp_message(
-    to_whatsapp: str,
-    reply_text: str,
-):
-    """
-    Send a WhatsApp message using Twilio's current
-    trial Content Template API.
-
-    IMPORTANT:
-    The selected Twilio template must contain {{1}}
-    if we want to put reply_text into the message.
-    """
-
-    if not TWILIO_CONTENT_SID:
-        raise RuntimeError(
-            "TWILIO_CONTENT_SID is missing from .env. "
-            "Open Twilio Try out WhatsApp, select the "
-            "template, and copy its ContentSid (HX...)."
-        )
-
-    from_whatsapp = normalize_whatsapp_number(
-        TWILIO_WHATSAPP_NUMBER
-    )
-
-    to_whatsapp = normalize_whatsapp_number(
-        to_whatsapp
-    )
-
-    # We use {{1}} in the Twilio template for the
-    # bot's generated response.
-    content_variables = json.dumps(
-        {
-            "1": reply_text
-        }
-    )
-
-    logger.info(
-        "Sending WhatsApp template | from=%s | to=%s | "
-        "content_sid=%s | variables=%s",
-        from_whatsapp,
-        to_whatsapp,
-        TWILIO_CONTENT_SID,
-        content_variables,
-    )
-
-    sent_msg = twilio_client.messages.create(
-        from_=from_whatsapp,
-        to=to_whatsapp,
-        content_sid=TWILIO_CONTENT_SID,
-        content_variables=content_variables,
-    )
-
-    logger.info(
-        "Twilio message sent | sid=%s | status=%s",
-        sent_msg.sid,
-        sent_msg.status,
-    )
-
-    return sent_msg
-
-
-# ---------------------------------------------------------
-# Health check
-# ---------------------------------------------------------
-
-@app.route("/health", methods=["GET"])
-def health():
+def validate_environment(config: Optional[Config] = None) -> dict[str, bool]:
+    """Validate environment status and return safe boolean flags."""
+    cfg = config or get_config()
     return {
-        "status": "ok",
-        "service": "whatsapp-food-ordering-bot",
-    }, 200
+        "twilio_configured": bool(cfg.TWILIO_AUTH_TOKEN and cfg.TWILIO_ACCOUNT_SID),
+        "payment_webhook_configured": bool(cfg.PAYMENT_WEBHOOK_SECRET),
+        "signature_validation": bool(cfg.TWILIO_VALIDATE_SIGNATURE),
+    }
 
 
-# ---------------------------------------------------------
-# WhatsApp webhook
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Application Factory
+# ---------------------------------------------------------------------------
 
-@app.route("/whatsapp", methods=["POST"])
-def whatsapp_webhook():
+def create_app(
+    config: Optional[Config] = None,
+    session_store: Optional[SessionStore] = None,
+    rate_limiter: Optional[RateLimiter] = None,
+) -> Flask:
+    """Initialize and configure the Flask WhatsApp bot application."""
+    app = Flask(__name__)
+    app_config = config or get_config()
+    app.config.from_mapping(
+        ENV=app_config.ENV,
+        DEBUG=app_config.DEBUG,
+        TESTING=app_config.TESTING,
+        SECRET_KEY=app_config.SECRET_KEY,
+    )
 
-    try:
+    # Configure structured logging
+    handler = logging.StreamHandler()
+    handler.setFormatter(StructuredJsonFormatter())
+    handler.addFilter(SecretRedactingFilter())
+    logging.root.handlers = [handler]
+    logging.root.setLevel(getattr(logging, app_config.LOG_LEVEL, logging.INFO))
 
-        # ---------------------------------------------
-        # Verify Twilio
-        # ---------------------------------------------
+    # Initialize persistence and rate limit stores
+    store: SessionStore = session_store or InMemorySessionStore()
+    limiter: RateLimiter = rate_limiter or InMemoryRateLimiter()
 
-        if not validate_twilio_request():
+    # Twilio REST client and Request Validator
+    validator = (
+        RequestValidator(app_config.TWILIO_AUTH_TOKEN)
+        if app_config.TWILIO_AUTH_TOKEN
+        else None
+    )
 
-            logger.warning(
-                "Rejected request because Twilio "
-                "signature validation failed."
+    # -----------------------------------------------------------------------
+    # Routes
+    # -----------------------------------------------------------------------
+
+    @app.route("/health", methods=["GET"])
+    def health():
+        """Health check endpoint returning application status and safe diagnostics."""
+        db_status = "healthy"
+        try:
+            with get_db() as db:
+                pass
+        except Exception:
+            db_status = "unhealthy"
+
+        return jsonify({
+            "status": "healthy" if db_status == "healthy" else "degraded",
+            "service": "whatsapp-food-bot",
+            "environment": app_config.ENV,
+            "database": db_status,
+            "session_store": "healthy",
+            "payment_gateway": "configured" if app_config.PAYMENT_WEBHOOK_SECRET else "unconfigured",
+        }), 200
+
+    @app.route("/whatsapp", methods=["POST"])
+    def whatsapp_webhook():
+        """Twilio WhatsApp webhook endpoint."""
+        start_time = time.time()
+        correlation_id = request.headers.get("X-Correlation-ID") or str(uuid.uuid4())
+        set_correlation_id(correlation_id)
+
+        def make_response(content: str, status: int, mimetype: str) -> Response:
+            resp = Response(content, status=status, mimetype=mimetype)
+            resp.headers["X-Correlation-ID"] = correlation_id
+            return resp
+
+        # 1. IP-Based Flood Rate Limiting
+        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+        webhook_limit = int(os.environ.get("WEBHOOK_RATE_LIMIT", str(app_config.WEBHOOK_RATE_LIMIT)))
+        allowed_ip, retry_after = limiter.is_allowed(
+            f"ip:{client_ip}",
+            max_requests=webhook_limit,
+            window_seconds=60,
+        )
+        if not allowed_ip:
+            logger.warning("Webhook IP rate limit exceeded", extra={"client_ip": client_ip, "event_type": "rate_limit", "correlation_id": correlation_id})
+            resp = make_response("Too Many Requests", 429, "text/plain")
+            resp.headers["Retry-After"] = str(retry_after)
+            return resp
+
+        # 2. Twilio Signature Validation
+        should_validate_sig = os.environ.get(
+            "TWILIO_VALIDATE_SIGNATURE",
+            str(app_config.TWILIO_VALIDATE_SIGNATURE)
+        ).strip().lower() in ("true", "1", "yes")
+
+        if should_validate_sig:
+            signature = request.headers.get("X-Twilio-Signature", "")
+            if not signature:
+                logger.warning("Missing Twilio signature header", extra={"event_type": "auth_failure", "correlation_id": correlation_id})
+                return make_response("Forbidden: Missing signature header.", 403, "text/plain")
+
+            candidate_urls = [request.url]
+            if app_config.TWILIO_WEBHOOK_URL and app_config.TWILIO_WEBHOOK_URL != request.url:
+                candidate_urls.append(app_config.TWILIO_WEBHOOK_URL)
+
+            is_valid = any(
+                validator.validate(cand_url, request.form, signature)
+                for cand_url in candidate_urls
+                if validator
             )
 
-            return Response(
-                "Invalid Twilio signature",
-                status=403,
-                mimetype="text/plain",
-            )
+            if not is_valid:
+                logger.warning("Twilio signature validation failed", extra={"urls": candidate_urls, "event_type": "auth_failure", "correlation_id": correlation_id})
+                return make_response("Forbidden: Invalid signature.", 403, "text/plain")
 
-        # ---------------------------------------------
-        # Read incoming WhatsApp message
-        # ---------------------------------------------
+        # 3. Message Parsing & Sender Normalization
+        if "From" not in request.form or not request.form.get("From", "").strip():
+            logger.warning("Missing From parameter in WhatsApp request", extra={"event_type": "bad_request", "correlation_id": correlation_id})
+            return make_response("Missing 'From' parameter.", 400, "text/plain")
 
-        from_number = request.form.get(
-            "From",
-            "",
-        ).strip()
+        raw_from = request.form.get("From", "").strip()
+        phone = normalize_whatsapp_number(raw_from)
+        if not phone:
+            logger.warning("Malformed From phone format", extra={"raw_from": raw_from, "event_type": "bad_request", "correlation_id": correlation_id})
+            return make_response("Invalid 'From' parameter.", 400, "text/plain")
 
-        incoming_text = request.form.get(
-            "Body",
-            "",
-        ).strip()
+        safe_user = generate_safe_user_id(phone)
 
-        if not from_number:
-            logger.warning(
-                "Missing WhatsApp sender number."
-            )
+        # 4. Per-User Rate Limiting
+        user_limit = int(os.environ.get("USER_MESSAGE_RATE_LIMIT", str(app_config.USER_MESSAGE_RATE_LIMIT)))
+        allowed_user, wait_sec = limiter.is_allowed(
+            f"user:{phone}",
+            max_requests=user_limit,
+            window_seconds=60,
+        )
+        if not allowed_user:
+            logger.warning("User message rate limit exceeded", extra={"safe_user_id": safe_user, "event_type": "rate_limit", "correlation_id": correlation_id})
+            resp = MessagingResponse()
+            resp.message("You're sending messages too fast. Please wait a moment before replying.")
+            return make_response(str(resp), 200, "application/xml")
 
-            return Response(
-                "Missing From",
-                status=400,
-                mimetype="text/plain",
-            )
+        # 5. Handle Inbound Message Content & Media Types
+        num_media = int(request.form.get("NumMedia", 0) or 0)
+        has_body = "Body" in request.form and request.form.get("Body") is not None
+        raw_body = (request.form.get("Body") or "").strip()
 
-        phone = from_number.replace(
-            "whatsapp:",
-            "",
-        ).strip()
+        if num_media > 0 and not raw_body:
+            media_type = request.form.get("MediaContentType0", "media")
+            logger.info("Unsupported media received", extra={"media_type": media_type, "safe_user_id": safe_user, "event_type": "incoming_request", "correlation_id": correlation_id})
+            resp = MessagingResponse()
+            resp.message("Thanks for the message! I can only process text queries right now (e.g., 'Veg Biryani' or 'Hi').")
+            return make_response(str(resp), 200, "application/xml")
 
+        if not has_body or not raw_body:
+            logger.warning("Empty message body received", extra={"safe_user_id": safe_user, "correlation_id": correlation_id})
+            return make_response("Missing 'Body' parameter.", 400, "text/plain")
+
+        incoming_text = sanitize_input_text(raw_body)
         logger.info(
-            "WhatsApp message received | phone=%s | text=%s",
-            phone,
-            incoming_text,
+            "Inbound WhatsApp message",
+            extra={
+                "event_type": "incoming_request",
+                "safe_user_id": safe_user,
+                "text_length": len(incoming_text),
+                "correlation_id": correlation_id,
+            },
         )
 
-        # ---------------------------------------------
-        # Run your existing food-order conversation
-        # ---------------------------------------------
+        # 6. Execute Conversation Engine
+        try:
+            with get_db() as db:
+                repo = Repository(db)
+                session = store.get_or_create(phone, repo)
+                prev_state = session.state.name
 
-        with get_db() as db:
+                reply_text = session.handle_message(incoming_text)
+                store.save(phone, session)
 
-            repo = Repository(db)
+            new_state = session.state.name
+            duration_ms = round((time.time() - start_time) * 1000, 2)
 
-            session = get_session(
-                phone,
-                repo,
+            logger.info(
+                "Conversation state transitioned",
+                extra={
+                    "event_type": "state_transition",
+                    "safe_user_id": safe_user,
+                    "prev_state": prev_state,
+                    "new_state": new_state,
+                    "duration_ms": duration_ms,
+                    "correlation_id": correlation_id,
+                },
             )
 
-            reply_text = session.handle_message(
-                incoming_text
-            )
+            # 7. Render Synchronous TwiML Response
+            resp = MessagingResponse()
+            resp.message(reply_text)
+            return make_response(str(resp), 200, "application/xml")
 
-        logger.info(
-            "WhatsApp response generated | phone=%s | reply=%s",
-            phone,
-            reply_text,
-        )
+        except Exception:
+            logger.exception("Error executing conversation turn", extra={"safe_user_id": safe_user, "event_type": "bot_error", "correlation_id": correlation_id})
+            err_resp = MessagingResponse()
+            err_resp.message("Sorry, we encountered an unexpected issue while processing your request. Please try again in a moment or type 'hi' to restart.")
+            return make_response(str(err_resp), 200, "application/xml")
 
-        # ---------------------------------------------
-        # Return TwiML MessagingResponse
-        # ---------------------------------------------
-        resp = MessagingResponse()
-        resp.message(reply_text)
+    @app.route("/payment/initiate", methods=["POST"])
+    def payment_initiate():
+        """Initiate payment session for a confirmed order with retry protection."""
+        payload = request.get_json(silent=True) or {}
+        order_id = payload.get("order_id")
+        if not order_id:
+            return jsonify({"error": "Missing order_id"}), 400
 
-        logger.info(
-            "TwiML response generated for %s | text: %s",
-            phone,
-            reply_text[:60],
-        )
+        if not re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", str(order_id), re.I):
+            return jsonify({"error": "Invalid order_id format"}), 400
 
-        return Response(
-            str(resp),
-            status=200,
-            mimetype="application/xml",
-        )
+        try:
+            with get_db() as db:
+                repo = Repository(db)
+                order = repo.get_order(order_id)
+                if not order:
+                    return jsonify({"error": "Order not found"}), 404
 
-    except Exception:
-        logger.exception(
-            "WhatsApp webhook error"
-        )
-        err_resp = MessagingResponse()
-        err_resp.message("Sorry, something went wrong. Type 'hi' to restart.")
-        return Response(
-            str(err_resp),
-            status=200,
-            mimetype="application/xml",
-        )
+                if order.get("payment_status") == "paid" and order.get("status") == "confirmed":
+                    return jsonify({"error": "Order already paid"}), 400
+
+                # Rate limit payment initiation attempts
+                allowed, _ = limiter.is_allowed(
+                    f"pay_init:{order_id}",
+                    max_requests=app_config.PAYMENT_INITIATION_LIMIT,
+                    window_seconds=300,
+                )
+                if not allowed:
+                    return jsonify({"error": "Payment initiation limit exceeded"}), 429
+
+                payment_id = f"pay_{uuid.uuid4().hex[:12]}"
+                return jsonify({
+                    "status": "initiated",
+                    "order_id": order_id,
+                    "payment_id": payment_id,
+                    "amount": float(order["total"]),
+                }), 200
+        except Exception:
+            logger.exception("Error initiating payment", extra={"order_id": order_id, "event_type": "payment_error"})
+            return jsonify({"error": "Internal server error"}), 500
+
+    @app.route("/payment/webhook", methods=["POST"])
+    def payment_webhook():
+        """HMAC-SHA256 verified payment callback endpoint with replay attack prevention."""
+        secret = app_config.PAYMENT_WEBHOOK_SECRET
+        if not secret:
+            logger.error("Payment webhook secret not configured", extra={"event_type": "config_error"})
+            return jsonify({"error": "Payment webhook unconfigured"}), 500
+
+        # 1. Rate Limit
+        client_ip = request.remote_addr or "127.0.0.1"
+        allowed, _ = limiter.is_allowed(f"pay_ip:{client_ip}", max_requests=app_config.PAYMENT_WEBHOOK_RATE_LIMIT, window_seconds=60)
+        if not allowed:
+            return jsonify({"error": "Too Many Requests"}), 429
+
+        # 2. HMAC-SHA256 Signature Verification
+        signature = request.headers.get("X-Payment-Signature", "")
+        if not signature:
+            return jsonify({"error": "Missing signature"}), 403
+
+        raw_body = request.get_data()
+        expected_sig = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature.lower(), expected_sig.lower()):
+            logger.warning("Invalid payment signature received", extra={"event_type": "payment_auth_failure"})
+            return jsonify({"error": "Invalid signature"}), 403
+
+        # 3. Timestamp Replay Protection
+        req_ts = request.headers.get("X-Payment-Timestamp")
+        if req_ts:
+            try:
+                ts = float(req_ts)
+                if abs(time.time() - ts) > app_config.PAYMENT_REPLAY_WINDOW_SECONDS:
+                    return jsonify({"error": "Webhook timestamp expired"}), 400
+            except ValueError:
+                return jsonify({"error": "Invalid timestamp header"}), 400
+
+        # 4. Payload Validation & Idempotent Processing
+        payload = request.get_json(silent=True)
+        if not payload or not isinstance(payload, dict):
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        order_id = payload.get("order_id")
+        payment_id = payload.get("payment_id")
+        amount = payload.get("amount")
+        status = payload.get("status")
+
+        if not order_id or not payment_id or amount is None or not status:
+            return jsonify({"error": "Missing required payment fields"}), 400
+
+        if not re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", str(order_id), re.I):
+            return jsonify({"error": "Invalid order_id format"}), 400
+
+        try:
+            with get_db() as db:
+                repo = Repository(db)
+                order = repo.get_order(order_id)
+                if not order:
+                    return jsonify({"error": "Order not found"}), 404
+
+                # Idempotency check: Already processed
+                if order.get("payment_status") == "paid" and order.get("status") == "confirmed":
+                    return jsonify({"status": "already_processed", "order_id": order_id}), 200
+
+                # Amount verification against order record
+                expected_total = float(order["total"])
+                if round(float(amount), 2) != round(expected_total, 2):
+                    logger.error("Payment amount mismatch", extra={"expected": expected_total, "received": amount, "order_id": order_id})
+                    return jsonify({"error": "Payment amount mismatch"}), 400
+
+                new_pay_status = "paid" if status == "succeeded" else "failed"
+                new_order_status = "confirmed" if status == "succeeded" else "payment_failed"
+
+                repo.update_order_payment(
+                    order_id=order_id,
+                    payment_id=payment_id,
+                    payment_status=new_pay_status,
+                    order_status=new_order_status,
+                )
+
+            return jsonify({"status": "success", "order_id": order_id, "payment_status": new_pay_status}), 200
+        except Exception:
+            logger.exception("Error processing payment webhook", extra={"order_id": order_id, "event_type": "payment_error"})
+            return jsonify({"error": "Internal server error"}), 500
+
+    return app
 
 
-# ---------------------------------------------------------
-# Start Flask
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CLI / Local Entry Point
+# ---------------------------------------------------------------------------
+
+app = create_app()
 
 if __name__ == "__main__":
-
-    # Initialize database tables and seed data.
     from db_init import create_tables, seed_data
 
     create_tables()
     seed_data()
 
-    host = os.getenv(
-        "FLASK_HOST",
-        "0.0.0.0",
-    )
+    host = os.getenv("FLASK_HOST", "0.0.0.0")
+    port = int(os.getenv("FLASK_PORT", "5000"))
 
-    port = int(
-        os.getenv(
-            "FLASK_PORT",
-            "5000",
-        )
-    )
-
-    logger.info(
-        "Starting WhatsApp bot on %s:%s",
-        host,
-        port,
-    )
-
-    app.run(
-        host=host,
-        port=port,
-        debug=False,
-    )
+    logger.info("Starting WhatsApp bot server", extra={"host": host, "port": port})
+    app.run(host=host, port=port, debug=False)

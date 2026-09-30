@@ -21,7 +21,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select
 
 from models import MenuItem, User, PromoCode, Order
-from db_models import UserRow, MenuItemRow, PromoCodeRow, OrderRow
+from db_models import (
+    UserRow,
+    MenuItemRow,
+    PromoCodeRow,
+    OrderRow,
+    OrderItemRow,
+    UserAddressRow,
+    ConversationRow,
+    MessageRow,
+    PromoRedemptionRow,
+    RecommendationEventRow,
+    IdempotencyRecordRow,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -293,3 +305,189 @@ class Repository:
             }
             for r in rows
         ]
+
+    # -- User Addresses ------------------------------------------------------
+
+    def add_user_address(self, phone: str, full_address: str, label: str = "Home",
+                         landmark: str | None = None, is_default: bool = False) -> str:
+        """Add an address to the user's address book."""
+        addr_id = str(uuid.uuid4())
+        if is_default:
+            # Unset any existing default address
+            existing_defaults = self._db.execute(
+                select(UserAddressRow).where(
+                    UserAddressRow.user_phone == phone,
+                    UserAddressRow.is_default == True,
+                )
+            ).scalars().all()
+            for addr in existing_defaults:
+                addr.is_default = False
+
+        row = UserAddressRow(
+            id=addr_id,
+            user_phone=phone,
+            label=label,
+            full_address=full_address,
+            landmark=landmark,
+            is_default=is_default,
+        )
+        self._db.add(row)
+
+        # Sync with user default_address if primary
+        if is_default:
+            user = self._db.get(UserRow, phone)
+            if user:
+                user.default_address = full_address
+
+        self._db.flush()
+        return addr_id
+
+    def list_user_addresses(self, phone: str) -> list[dict]:
+        """List active saved addresses for a user."""
+        rows = self._db.execute(
+            select(UserAddressRow).where(
+                UserAddressRow.user_phone == phone,
+                UserAddressRow.is_deleted == False,
+            ).order_by(UserAddressRow.is_default.desc(), UserAddressRow.created_at.desc())
+        ).scalars().all()
+        return [
+            {
+                "id": r.id,
+                "label": r.label,
+                "full_address": r.full_address,
+                "landmark": r.landmark,
+                "is_default": r.is_default,
+            }
+            for r in rows
+        ]
+
+    # -- Promo Redemptions & Usage Limits ------------------------------------
+
+    def record_promo_redemption(self, code: str, phone: str, order_id: str, discount: float) -> str:
+        """Record a promo redemption for fraud prevention and audit."""
+        redemption_id = str(uuid.uuid4())
+        row = PromoRedemptionRow(
+            id=redemption_id,
+            promo_code=code,
+            user_phone=phone,
+            order_id=order_id,
+            discount_applied=discount,
+        )
+        self._db.add(row)
+        self._db.flush()
+        return redemption_id
+
+    def get_promo_redemption_count(self, code: str, phone: str) -> int:
+        """Return the number of times a user has redeemed a specific promo code."""
+        rows = self._db.execute(
+            select(PromoRedemptionRow).where(
+                PromoRedemptionRow.promo_code == code,
+                PromoRedemptionRow.user_phone == phone,
+            )
+        ).scalars().all()
+        return len(rows)
+
+    # -- Durable Conversations & Messages -----------------------------------
+
+    def save_conversation_state(self, phone: str, state: str, session_data_json: str,
+                                expected_version: int = 1) -> int:
+        """Persist or update conversation state with optimistic locking.
+
+        Returns the new version number.
+        """
+        row = self._db.execute(
+            select(ConversationRow).where(ConversationRow.user_phone == phone)
+        ).scalar_one_or_none()
+
+        if row is None:
+            new_row = ConversationRow(
+                id=str(uuid.uuid4()),
+                user_phone=phone,
+                state=state,
+                session_data=session_data_json,
+                version=1,
+            )
+            self._db.add(new_row)
+            self._db.flush()
+            return 1
+
+        # Optimistic locking check
+        if row.version != expected_version:
+            raise RepositoryError(
+                f"Concurrent conversation update conflict for user {phone}. "
+                f"Expected version {expected_version}, found {row.version}."
+            )
+
+        row.state = state
+        row.session_data = session_data_json
+        row.version += 1
+        row.last_active_at = datetime.now(timezone.utc)
+        self._db.flush()
+        return row.version
+
+    def get_conversation_state(self, phone: str) -> dict | None:
+        """Retrieve durable conversation state and draft session data."""
+        row = self._db.execute(
+            select(ConversationRow).where(ConversationRow.user_phone == phone)
+        ).scalar_one_or_none()
+
+        if not row:
+            return None
+
+        return {
+            "id": row.id,
+            "user_phone": row.user_phone,
+            "state": row.state,
+            "session_data": row.session_data,
+            "version": row.version,
+            "last_active_at": row.last_active_at,
+        }
+
+    def log_audit_message(self, phone: str, direction: str, body: str,
+                          twilio_message_sid: str | None = None,
+                          detected_intent: str | None = None,
+                          nlu_confidence: float | None = None) -> str:
+        """Append a message to the immutable audit trail."""
+        msg_id = str(uuid.uuid4())
+        row = MessageRow(
+            id=msg_id,
+            user_phone=phone,
+            direction=direction,
+            body=body,
+            twilio_message_sid=twilio_message_sid,
+            detected_intent=detected_intent,
+            nlu_confidence=nlu_confidence,
+        )
+        self._db.add(row)
+        self._db.flush()
+        return msg_id
+
+    # -- Idempotency Ledger --------------------------------------------------
+
+    def check_idempotency(self, key: str) -> dict | None:
+        """Check if request key was already processed."""
+        row = self._db.get(IdempotencyRecordRow, key)
+        if not row:
+            return None
+        return {
+            "key": row.key,
+            "status": row.status,
+            "response_payload": row.response_payload,
+            "created_at": row.created_at,
+            "expires_at": row.expires_at,
+        }
+
+    def save_idempotency(self, key: str, status: str, response_payload: str,
+                         ttl_seconds: int = 86400) -> None:
+        """Save idempotency key and cached response."""
+        from datetime import timedelta
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+        row = IdempotencyRecordRow(
+            key=key,
+            status=status,
+            response_payload=response_payload,
+            expires_at=expires_at,
+        )
+        self._db.merge(row)
+        self._db.flush()
+

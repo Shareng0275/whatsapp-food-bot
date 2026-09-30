@@ -37,7 +37,11 @@ wheels/
 *.sqlite3
 .venv/
 *.db-journal
+*.db-wal
+*.db-shm
 dev.db
+*.csv
+zomato.csv/
 
 # Testing & Coverage
 .pytest_cache/

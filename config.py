@@ -49,6 +49,7 @@ class Config:
     TWILIO_AUTH_TOKEN: str = field(default_factory=lambda: os.environ.get("TWILIO_AUTH_TOKEN", ""))
     TWILIO_WHATSAPP_NUMBER: str = field(default_factory=lambda: os.environ.get("TWILIO_WHATSAPP_NUMBER", ""))
     TWILIO_VALIDATE_SIGNATURE: bool = field(default_factory=lambda: os.environ.get("TWILIO_VALIDATE_SIGNATURE", "true").strip().lower() in ("true", "1", "yes"))
+    TWILIO_WEBHOOK_URL: str = field(default_factory=lambda: os.environ.get("TWILIO_WEBHOOK_URL", ""))
 
     # Payment Gateway
     PAYMENT_WEBHOOK_SECRET: str = field(default_factory=lambda: os.environ.get("PAYMENT_WEBHOOK_SECRET", ""))

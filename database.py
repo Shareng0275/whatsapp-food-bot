@@ -1,7 +1,7 @@
 """SQLAlchemy engine and session factory.
 
-Reads DATABASE_URL from the environment.  Falls back to a local PostgreSQL
-default so ``simulate.py`` works out-of-the-box on a dev machine.
+Reads DATABASE_URL from the environment.
+Configures SQLite with busy timeout and WAL mode for reliable concurrency during local development.
 
 Usage
 -----
@@ -14,8 +14,8 @@ Usage
 import os
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session as SASession, DeclarativeBase
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Session as SASession, sessionmaker
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -28,7 +28,29 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+connect_args = {}
+if "sqlite" in DATABASE_URL:
+    connect_args = {"timeout": 30, "check_same_thread": False}
+
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+    connect_args=connect_args,
+)
+
+if "sqlite" in DATABASE_URL:
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+        finally:
+            cursor.close()
+
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 

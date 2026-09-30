@@ -5,6 +5,9 @@
 """
 import sys
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 from database import get_db
 from repository import Repository
 from conversation import Session
